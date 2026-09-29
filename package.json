@@ -113,7 +113,7 @@
     "prettier": "^3.9.8",
     "sucrase": "^3.35.1",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.67.0"
+    "typescript-eslint": "^8.70.1"
   },
   "jest": {
     "transform": {
