@@ -1,0 +1,429 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # "Run workflow" on main re-runs the pipeline and deploys, e.g. to recreate the stack after
+  # the Destroy workflow.
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a run on main mid-deploy (it could leave a Terraform state lock behind).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  secrets-scan:
+    runs-on: ubuntu-latest
+    name: Secret Scanning (gitleaks)
+
+    steps:
+    - name: Checkout code (full history)
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Install gitleaks
+      run: |
+        curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar xz -C /usr/local/bin gitleaks
+
+    - name: Scan git history for secrets
+      run: gitleaks detect --source . --redact -v
+
+  quality:
+    runs-on: ubuntu-latest
+    name: Code Quality & Unit Tests
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Use Node.js 24.x
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run ESLint
+      run: npm run lint:ci
+
+    - name: Check code formatting with Prettier
+      run: npx prettier --check src/
+
+    - name: Type-check
+      run: npm run typecheck
+
+    - name: Run unit tests
+      run: npm test
+
+    - name: Build project
+      run: npm run build
+
+    - name: Run security audit
+      run: npm run security
+
+    - name: Check for outdated dependencies
+      run: npm outdated || echo "Some dependencies are outdated"
+
+  integration:
+    runs-on: ubuntu-latest
+    name: Integration & E2E Tests
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: graphql_mysql
+          MYSQL_USER: graphql_user
+          MYSQL_PASSWORD: graphql_pass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -u root -prootpassword"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      NODE_ENV: development
+      PORT: 4003
+      DOTENV_CONFIG_QUIET: 'true'
+      ALLOWED_ORIGINS: http://localhost:4003
+      JWT_SECRET: ci-only-secret-not-used-anywhere-else-32chars
+      DATABASE_CLIENT: mysql2
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: 3306
+      DATABASE_NAME: graphql_mysql
+      DATABASE_USER: graphql_user
+      DATABASE_PASSWORD: graphql_pass
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Use Node.js 24.x
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run migrations
+      run: npm run migrate
+
+    - name: Seed development data
+      run: npm run seed
+
+    - name: Run integration tests (real MySQL)
+      run: npm run test:integration
+
+    - name: Build project
+      run: npm run build
+
+    - name: Start server
+      run: node -r dotenv/config dist/index.js &
+
+    - name: Wait for server to be ready
+      run: |
+        for i in $(seq 1 30); do
+          if curl -s -o /dev/null -w "%{http_code}" http://localhost:4003/ready | grep -q 200; then
+            echo "Server is up"
+            exit 0
+          fi
+          echo "Waiting for server... ($i/30)"
+          sleep 1
+        done
+        echo "Server did not become ready in time"
+        exit 1
+
+    - name: Run e2e tests
+      run: npm run test:e2e
+
+    - name: Run API/collection tests (Postman via Newman)
+      run: npm run test:api
+
+    - name: Install k6
+      run: |
+        curl -sL https://github.com/grafana/k6/releases/download/v1.0.0/k6-v1.0.0-linux-amd64.tar.gz | tar xz --strip-components 1 -C /usr/local/bin k6-v1.0.0-linux-amd64/k6
+
+    - name: Smoke-test the k6 load test script
+      run: SMOKE_TEST=true k6 run loadtest/graphql-load-test.js
+
+  k8s-lint:
+    runs-on: ubuntu-latest
+    name: Validate Kubernetes Manifests
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install kubeconform
+      run: |
+        curl -sL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz | tar xz -C /usr/local/bin kubeconform
+
+    - name: Validate manifests against the Kubernetes 1.32 schema
+      run: kubeconform -summary -strict -kubernetes-version 1.32.0 k8s/*.yaml
+
+  docker:
+    runs-on: ubuntu-latest
+    name: Docker Build & Runtime Validation
+    needs: quality
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Use Node.js 24.x
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Create .env for Docker Compose
+      run: |
+        cat > .env <<EOF
+        PORT=4003
+        NODE_ENV=development
+        ALLOWED_ORIGINS=http://localhost:4003
+        JWT_SECRET=ci-docker-secret-not-used-anywhere-else-32c
+        DATABASE_CLIENT=mysql2
+        DATABASE_HOST=127.0.0.1
+        DATABASE_PORT=3306
+        DATABASE_NAME=graphql_mysql
+        DATABASE_USER=graphql_user
+        DATABASE_PASSWORD=graphql_pass
+        MYSQL_ROOT_PASSWORD=rootpassword
+        LOG_LEVEL=info
+        EOF
+
+    - name: Build image and start containers
+      run: docker compose up -d --build
+
+    - name: Wait for MySQL container to be healthy
+      run: |
+        timeout 90 sh -c \
+          'until [ "$(docker inspect --format="{{.State.Health.Status}}" graphql_mysql)" = "healthy" ]; do sleep 2; done'
+
+    - name: Run migrations and seed against the containerized database
+      run: |
+        for i in $(seq 1 10); do
+          npm run db:setup && exit 0
+          echo "db:setup failed (attempt $i/10) — MySQL may still be restarting after init, retrying in 5s..."
+          sleep 5
+        done
+        echo "db:setup did not succeed after retries"
+        exit 1
+
+    - name: Wait for app container to be healthy
+      run: |
+        timeout 60 sh -c \
+          'until [ "$(docker inspect --format="{{.State.Health.Status}}" graphql_app)" = "healthy" ]; do sleep 2; done'
+
+    - name: Run e2e tests against the containerized server
+      run: npm run test:e2e
+
+    - name: Run API/collection tests against the containerized server
+      run: npm run test:api
+
+    - name: Show container logs on failure
+      if: failure()
+      run: docker compose logs
+
+    - name: Tear down containers
+      if: always()
+      run: docker compose down -v
+
+  infra:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      - name: infra/
+        working-directory: infra
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: bootstrap/
+        working-directory: bootstrap
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  # Deploys to real AWS on every push to main (or a manual run on main), once the checks pass.
+  # Auth is GitHub OIDC -> IAM role (bootstrap/), so no AWS keys are stored in GitHub.
+  # Configuration lives in the `production` GitHub environment (docs/deployment.md); until
+  # AWS_DEPLOY_ROLE_ARN is set there, the job skips the AWS steps and stays green.
+  deploy:
+    name: Deploy to AWS
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: [quality, integration, docker, infra]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_app_image_tag: ${{ github.sha }}
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - name: Check deploy configuration
+        id: config
+        env:
+          ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::notice title=Deploy skipped::AWS_DEPLOY_ROLE_ARN is not set in the production environment. Run scripts/bootstrap.sh (see docs/deployment.md)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          missing=""
+          [ -z "$AWS_REGION" ] && missing="$missing AWS_REGION"
+          [ -z "$STATE_BUCKET" ] && missing="$missing TF_STATE_BUCKET"
+          if [ -n "$missing" ]; then
+            echo "::error title=Deploy misconfigured::Missing in the production environment:$missing"
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.config.outputs.enabled == 'true'
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.config.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          terraform_wrapper: false
+
+      # The S3 backend is only added here, at deploy time, so local runs keep local state.
+      - name: Terraform init (S3 remote state)
+        if: steps.config.outputs.enabled == 'true'
+        working-directory: infra
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          cat > ci_backend.tf <<'EOF'
+          terraform {
+            backend "s3" {}
+          }
+          EOF
+          terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=graphql-node-reference-architecture/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # The ECS service needs the image to exist, so the registry comes first (a no-op after the
+      # first deploy), then the image is pushed, then the rest of the stack is applied.
+      - name: Terraform apply (ECR repository)
+        if: steps.config.outputs.enabled == 'true'
+        working-directory: infra
+        shell: bash
+        run: terraform apply -input=false -no-color -auto-approve -target=aws_ecr_repository.app 2>&1 | tee ecr.log
+
+      - name: Build and push the image
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          REPO=$(terraform -chdir=infra output -raw ecr_repository_url)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
+          docker build -t "$REPO:${{ github.sha }}" .
+          docker push "$REPO:${{ github.sha }}"
+
+      - name: Terraform plan
+        if: steps.config.outputs.enabled == 'true'
+        working-directory: infra
+        shell: bash
+        run: terraform plan -input=false -no-color -out=tfplan 2>&1 | tee plan.log
+
+      - name: Terraform apply
+        if: steps.config.outputs.enabled == 'true'
+        working-directory: infra
+        shell: bash
+        run: terraform apply -input=false -no-color tfplan 2>&1 | tee apply.log
+
+      # Surface each Terraform "Error:" block as a run annotation, so failures are readable
+      # from the run summary without downloading the raw log.
+      - name: Report Terraform errors
+        if: failure() && steps.config.outputs.enabled == 'true'
+        working-directory: infra
+        run: |
+          for f in ecr.log plan.log apply.log; do
+            [ -f "$f" ] || continue
+            awk '{ gsub(/%/, "%25") }
+                 /^Error: / { if (buf) print buf; buf = $0; n = 0; next }
+                 buf && n < 15 { buf = buf "%0A" $0; n++ }
+                 END { if (buf) print buf }' "$f" |
+              while IFS= read -r block; do echo "::error title=Terraform ($f)::${block}"; done
+          done
+
+      # `npm run db:setup` (migrations, then the seed data the API collection relies on) as a
+      # one-off ECS task: the image doesn't migrate on boot. See `db_setup` in infra/app.tf.
+      - name: Migrate and seed the database (one-off ECS task)
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          CLUSTER=$(terraform -chdir=infra output -raw ecs_cluster)
+          terraform -chdir=infra output -json db_setup_task > db-setup.json
+          NETWORK=$(jq -c '{awsvpcConfiguration: {subnets: .subnets, securityGroups: [.security_group], assignPublicIp: "ENABLED"}}' db-setup.json)
+          TASK=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE \
+            --task-definition "$(jq -r .task_definition db-setup.json)" \
+            --network-configuration "$NETWORK" --query 'tasks[0].taskArn' --output text)
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK"
+          EXIT=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          aws logs filter-log-events --log-group-name "$(jq -r .log_group db-setup.json)" \
+            --log-stream-name-prefix "db-setup/db-setup/${TASK##*/}" --query 'events[].message' --output text || true
+          if [ "$EXIT" != "0" ]; then
+            REASON=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" --query 'tasks[0].stoppedReason' --output text)
+            echo "::error title=db-setup task failed::exit code $EXIT ($REASON); see the db-setup log stream in $(jq -r .log_group db-setup.json)"
+            exit 1
+          fi
+
+      - name: Wait for the ECS services
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$(terraform -chdir=infra output -raw ecs_cluster)" \
+            --services $(terraform -chdir=infra output -json ecs_services | jq -r '.[]')
+
+      - name: Smoke tests (real AWS)
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          API=$(terraform -chdir=infra output -raw api_url)
+          TOKEN=$(aws ssm get-parameter --with-decryption \
+            --name "$(terraform -chdir=infra output -raw metrics_token_parameter)" \
+            --query Parameter.Value --output text)
+          echo "::add-mask::$TOKEN"
+          API_URL="$API" METRICS_TOKEN="$TOKEN" scripts/smoke-test.sh
+          {
+            echo "### Deployed :rocket:"
+            echo "GraphQL: ${API}/graphql (subscriptions: wss://${API#https://}/)"
+            echo
+            echo "Seed users (password Senha123): elisa.pereira, enzo_barros, talita.melo"
+          } >> "$GITHUB_STEP_SUMMARY"
