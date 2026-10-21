@@ -37,6 +37,20 @@ describe('knexfile', () => {
     expect(config.development.seeds.directory).toContain('seeds');
   });
 
+  it('connects over TLS with the Amazon RDS CA profile when DATABASE_SSL=rds', () => {
+    process.env.DATABASE_SSL = 'rds';
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const config = require('../knex/knexfile').default;
+    expect(config.production.connection).toMatchObject({ ssl: 'Amazon RDS' });
+  });
+
+  it('connects without TLS when DATABASE_SSL is unset', () => {
+    delete process.env.DATABASE_SSL;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const config = require('../knex/knexfile').default;
+    expect(config.production.connection).not.toHaveProperty('ssl');
+  });
+
   it('uses mysql2 as the default client when DATABASE_CLIENT is not set', () => {
     delete process.env.DATABASE_CLIENT;
     // eslint-disable-next-line @typescript-eslint/no-require-imports

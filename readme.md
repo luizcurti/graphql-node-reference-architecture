@@ -137,6 +137,7 @@ http://localhost:4003/graphql
 | `DATABASE_NAME` | Yes | Database name |
 | `DATABASE_USER` | Yes | Database user |
 | `DATABASE_PASSWORD` | Yes | Database password |
+| `DATABASE_SSL` | No | `rds` to connect over TLS verified against the Amazon RDS CA bundle that `mysql2` ships (the [AWS deployment](#aws)) |
 | `DATABASE_POOL_MIN` / `DATABASE_POOL_MAX` | No | Knex connection pool size (defaults: `2` / `10`) |
 | `DATABASE_REPLICA_HOST` / `DATABASE_REPLICA_PORT` | No | Optional read replica for list/batch queries |
 | `MYSQL_ROOT_PASSWORD` | Yes | MySQL root password (Docker only) |
@@ -618,10 +619,30 @@ Deployment from 2 to 3 replicas under load).
 
 </details>
 
+## AWS
+
+The same stack runs on AWS, deployed by GitHub Actions on every push to `main`:
+CloudFront → ALB → the API on ECS Fargate (queries, mutations and
+WebSocket subscriptions), RDS MySQL 8.4, ElastiCache Redis (TLS + AUTH) and
+Kafka as a Fargate service, all in Terraform ([`infra/`](./infra/)), with
+migrations and seeds as a one-off ECS task. GitHub Actions authenticates with
+OIDC (no AWS keys in GitHub), and [`scripts/smoke-test.sh`](./scripts/smoke-test.sh)
+runs the Postman collection against the live stack, then checks that the
+`createComment` event really went through Kafka.
+
+```bash
+scripts/bootstrap.sh                                                                                           # once: state bucket, deploy role, GitHub environment
+gh workflow run ci.yml --repo luizcurti/graphql-node-reference-architecture --ref main                         # deploy
+gh workflow run destroy.yml --repo luizcurti/graphql-node-reference-architecture --ref main -f confirm=destroy # tear down
+```
+
+Details, architecture and costs: [docs/deployment.md](./docs/deployment.md).
+
 ## CI
 
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs on every push
-and pull request to `main`, as five jobs:
+and pull request to `main`, as five jobs, plus `infra` (Terraform fmt +
+validate) and, on `main` only, `deploy` (see [AWS](#aws)):
 
 | Job | Runs |
 |---|---|
