@@ -6,3 +6,9 @@ coverage
 bcrypt-jwt.js
 k8s/secret.yaml
 k8s/*.local.yaml
+# Terraform (infra/, bootstrap/)
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+infra/ci_backend.tf

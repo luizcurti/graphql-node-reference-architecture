@@ -30,6 +30,10 @@ const sharedConfig: Omit<Knex.Config, 'migrations' | 'seeds'> = {
     // of the host/container OS timezone (avoids DST-gap datetimes like
     // '2015-10-18 00:56:33' being rejected in America/Sao_Paulo).
     timezone: 'Z',
+    // DATABASE_SSL=rds: TLS verified against the Amazon RDS CA bundle that
+    // mysql2 ships (its built-in 'Amazon RDS' profile), so no certificate
+    // file needs to be baked into the image. Unset for the local MySQL.
+    ...(process.env.DATABASE_SSL === 'rds' && { ssl: 'Amazon RDS' }),
   },
   pool: {
     min: Number(process.env.DATABASE_POOL_MIN) || 2,
